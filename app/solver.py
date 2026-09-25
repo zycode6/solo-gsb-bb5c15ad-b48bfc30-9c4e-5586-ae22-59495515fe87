@@ -44,6 +44,13 @@
 全部非支配方案; 同一对指标只保留关阀编号升序列表字典序最小者, 结果按
 (代价, 断水影响, 关阀编号列表) 升序排列。
 
+以及 plan_monitors(snapshot, closed_valves, raw_candidates): 已保存可行
+方案的失效监测点布设预览(只读计算)。从方案快照的非进水节点中录入至多
+12 个候选监测点(编号不得重复, 各自正整数布设费); 模拟正常执行与每枚
+计划关闭阀门单独关不上时的供水连通状态, 选出布设费总和最低、同费按
+节点编号升序列表字典序最小的点集, 使任意两种情形在所选点的有水/无水
+读数不同; 候选点无法区分某些情形时列出这些情形对。
+
 阀门最多 14 个, 枚举全部 2^V 个子集(V<=14 => 16384), 对每个子集做
 BFS 连通性检查即可, 简单且确定。
 """
@@ -55,6 +62,7 @@ from typing import Any
 
 MAX_VALVES = 14
 MAX_CANDIDATES = 6
+MAX_MONITOR_CANDIDATES = 12
 
 
 class NetworkValidationError(ValueError):
@@ -1400,4 +1408,220 @@ def solve_tradeoff(payload: dict[str, Any],
             f"关阀组合, 其中 {feasible_count} 个满足漏点全隔离且必保点全有"
             f"水; 按(关阀代价合计, 断水影响)双目标求得非支配方案 "
             f"{len(plans)} 个, 已按代价、断水影响升序排列。"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 失效监测点布设预览(只读计算, 针对已保存的可行方案)
+# ---------------------------------------------------------------------------
+
+def plan_monitors(snapshot: dict[str, Any],
+                  closed_valves: list[str],
+                  raw_candidates: Any) -> dict[str, Any]:
+    """已保存可行方案的失效监测点布设预览(只读计算, 不改方案与管网)。
+
+    从方案快照的**非进水节点**中录入至多 MAX_MONITOR_CANDIDATES 个候选
+    监测点(编号不得重复), 每个候选有正整数布设费。模拟 1+k 种情形
+    (k=计划关闭阀门数): 正常执行(全部计划阀门关闭)与每枚计划阀门单独
+    关不上(该阀保持开启、其余照常关闭), 按多进水点 BFS 求各情形下有水
+    的节点。监测点集可行当且仅当任意两种情形在该点集上的有水/无水读数
+    向量不同; 优化次序:
+      1) 布设费合计最小;
+      2) 节点编号升序列表字典序最小。
+    若全部候选点也无法区分某些情形对, 则无可行点集, 返回这些情形对。
+    """
+    try:
+        nodes, segments, valves = validate_network(snapshot)
+    except NetworkValidationError as exc:
+        raise NetworkValidationError(
+            ["方案快照数据不合法: " + e for e in exc.errors]) from exc
+
+    errors: list[str] = []
+
+    # ---- 计划关闭阀门必须存在于快照管网中 ----
+    valve_by_id = {vl["id"]: vl for vl in valves}
+    closed = sorted(dict.fromkeys(_norm_id(v) for v in (closed_valves or [])))
+    for vid in closed:
+        if vid not in valve_by_id:
+            errors.append(f"方案关闭的阀门 {vid} 不存在于方案快照的管网中")
+
+    # ---- 候选监测点录入校验: 数量 / 非进水节点 / 编号唯一 / 正整数布设费 ----
+    if raw_candidates is None:
+        raw_candidates = []
+    if not isinstance(raw_candidates, list):
+        raise NetworkValidationError(["candidates 必须是数组"])
+    if len(raw_candidates) > MAX_MONITOR_CANDIDATES:
+        errors.append(f"候选监测点数量为 {len(raw_candidates)}, "
+                      f"超过上限 {MAX_MONITOR_CANDIDATES} 个")
+    node_by_id = {nd["id"]: nd for nd in nodes}
+    cands: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for i, cd in enumerate(raw_candidates):
+        if not isinstance(cd, dict):
+            errors.append(f"候选监测点 #{i + 1}: 必须是对象")
+            continue
+        nid = _norm_id(cd.get("node_id"))
+        label = nid or f"#{i + 1}"
+        if not nid:
+            errors.append(f"候选监测点 #{i + 1}: 缺少节点编号")
+        elif nid in seen_ids:
+            errors.append(f"监测点编号重复: {nid}")
+        elif nid not in node_by_id:
+            errors.append(f"候选监测点 {nid} 不存在于方案快照的节点中")
+        elif node_by_id[nid]["role"] == "inlet":
+            errors.append(f"候选监测点 {nid} 是进水点, 只能在非进水节点布设")
+        seen_ids.add(nid)
+        cost = _positive_int(cd.get("cost"))
+        if cost is None:
+            errors.append(f"监测点 {label} 的布设费必须是正整数, "
+                          f"收到: {cd.get('cost')!r}")
+        cands.append({"node_id": nid, "cost": cost})
+    if errors:
+        raise NetworkValidationError(errors)
+
+    # ---- 情形: 正常执行 + 每枚计划阀门单独关不上(该阀保持开启) ----
+    g = _Graph(nodes, segments, valves)
+    v_idx = {vl["id"]: b for b, vl in enumerate(g.valves_sorted)}
+    base_mask = 0
+    for vid in closed:
+        base_mask |= 1 << v_idx[vid]
+    scenarios: list[dict[str, Any]] = [{
+        "scenario": "normal",
+        "failed_valve": None,
+        "label": "正常执行(全部按计划关闭)",
+        "mask": base_mask,
+    }]
+    for vid in closed:
+        scenarios.append({
+            "scenario": "valve_failure",
+            "failed_valve": vid,
+            "label": f"阀门 {vid} 关不上(保持开启)",
+            "mask": base_mask ^ (1 << v_idx[vid]),
+        })
+    s_count = len(scenarios)
+    for sc in scenarios:
+        sc["effective_closed_valves"] = g.closed_names(sc["mask"])
+        sc["fed"] = g.reachable(sc["mask"], g.inlet_set)
+
+    # ---- 每个候选点: 跨情形读数位掩码 -> 可区分的情形对位掩码 ----
+    # pair_bit[(i,j)]: 情形对 (i,j) 的位; 候选点 p 的 dpat 含 (i,j) 位 <=>
+    # p 在情形 i 与情形 j 的有水/无水读数不同。
+    m = len(cands)
+    pair_bit = {(i, j): 1 << (i * s_count + j)
+                for i in range(s_count) for j in range(i + 1, s_count)}
+    all_pairs_mask = 0
+    for bit in pair_bit.values():
+        all_pairs_mask |= bit
+    pats: list[int] = []   # pats[j]: 候选点 j 在各情形有水的位掩码
+    dpats: list[int] = []  # dpats[j]: 候选点 j 可区分的情形对位掩码
+    for cd in cands:
+        ni = g.idx[cd["node_id"]]
+        p = 0
+        for si, sc in enumerate(scenarios):
+            if (sc["fed"] >> ni) & 1:
+                p |= 1 << si
+        pats.append(p)
+        d = 0
+        for (i, j), bit in pair_bit.items():
+            if ((p >> i) ^ (p >> j)) & 1:
+                d |= bit
+        dpats.append(d)
+
+    # ---- 子集并集(可区分情形对)与布设费合计: lowbit DP ----
+    size = 1 << m
+    union_d = [0] * size
+    cost_sum = [0] * size
+    for s in range(1, size):
+        low = s & -s
+        b = low.bit_length() - 1
+        union_d[s] = union_d[s ^ low] | dpats[b]
+        cost_sum[s] = cost_sum[s ^ low] + cands[b]["cost"]
+
+    cand_sorted_idx = sorted(range(m), key=lambda j: cands[j]["node_id"])
+
+    def _readings(si: int, idxs: list[int]) -> list[dict[str, Any]]:
+        return [{"node_id": cands[j]["node_id"],
+                 "supplied": bool((pats[j] >> si) & 1)} for j in idxs]
+
+    def _scenario_out(si: int, idxs: list[int]) -> dict[str, Any]:
+        sc = scenarios[si]
+        return {
+            "scenario": sc["scenario"],
+            "failed_valve": sc["failed_valve"],
+            "label": sc["label"],
+            "effective_closed_valves": sc["effective_closed_valves"],
+            "readings": _readings(si, idxs),
+        }
+
+    def _scenario_ref(si: int) -> dict[str, Any]:
+        sc = scenarios[si]
+        return {"scenario": sc["scenario"],
+                "failed_valve": sc["failed_valve"],
+                "label": sc["label"]}
+
+    # ---- 全部候选点也无法区分的情形对 -> 无可行点集 ----
+    missing = all_pairs_mask & ~union_d[size - 1]
+    if missing:
+        pairs = [{"a": _scenario_ref(i), "b": _scenario_ref(j)}
+                 for (i, j), bit in pair_bit.items() if missing & bit]
+        pair_text = "; ".join(
+            f"{p['a']['label']} ↔ {p['b']['label']}" for p in pairs)
+        return {
+            "ok": False,
+            "reason_code": "INDISTINGUISHABLE_SCENARIOS",
+            "closed_valves": closed,
+            "candidate_count": m,
+            "scenario_count": s_count,
+            "scenarios": [_scenario_out(si, cand_sorted_idx)
+                          for si in range(s_count)],
+            "indistinguishable_pairs": pairs,
+            "message": (
+                f"失效监测点布设预览(只读, 不修改管网与历史方案): 候选监测点"
+                f"无法区分全部 {s_count} 种情形 — 以下 {len(pairs)} 对情形在"
+                f"所有候选点上的有水/无水读数完全相同: {pair_text}。"
+                f"请调整候选监测点。"),
+        }
+
+    # ---- 枚举候选子集: (布设费合计, 节点编号升序列表) 字典序最小 ----
+    best_key: tuple[int, tuple[str, ...]] | None = None
+    best_mask = 0
+    distinguishing = 0
+    for s in range(size):
+        if union_d[s] != all_pairs_mask:
+            continue
+        distinguishing += 1
+        ids = tuple(sorted(cands[j]["node_id"]
+                           for j in range(m) if (s >> j) & 1))
+        key = (cost_sum[s], ids)
+        if best_key is None or key < best_key:
+            best_key, best_mask = key, s
+
+    sel_idx = sorted((j for j in range(m) if (best_mask >> j) & 1),
+                     key=lambda j: cands[j]["node_id"])
+    selected = [{"node_id": cands[j]["node_id"], "cost": cands[j]["cost"]}
+                for j in sel_idx]
+    sel_ids = [c["node_id"] for c in selected]
+    total = cost_sum[best_mask]
+    if sel_ids:
+        message = (
+            f"失效监测点布设预览(只读, 不修改管网与历史方案): 在 "
+            f"{', '.join(sel_ids)} 布设 {len(sel_ids)} 个监测点, 布设费合计 "
+            f"{total}; 任意两种情形(正常执行 + {s_count - 1} 种单阀关不上)"
+            f"在所选点的有水/无水读数都不同。")
+    else:
+        message = ("失效监测点布设预览(只读, 不修改管网与历史方案): "
+                   "该方案不关闭任何阀门, 仅正常执行一种情形, "
+                   "无需布设监测点(空点集, 布设费合计 0)。")
+    return {
+        "ok": True,
+        "closed_valves": closed,
+        "candidate_count": m,
+        "scenario_count": s_count,
+        "scenarios": [_scenario_out(si, sel_idx) for si in range(s_count)],
+        "selected_points": selected,
+        "selected_node_ids": sel_ids,
+        "total_cost": total,
+        "subset_count": size,
+        "distinguishing_subset_count": distinguishing,
+        "message": message,
     }
