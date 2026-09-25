@@ -335,6 +335,7 @@ function renderResult(r) {
     renderFailover(r, banner, body);
     appendSequencePanel(r);
     appendJumperPanel(r);
+    appendMonitorPanel(r);
     drawCanvas();
     return;
   }
@@ -361,6 +362,7 @@ function renderResult(r) {
     </div>`;
   appendSequencePanel(r);
   appendJumperPanel(r);
+  appendMonitorPanel(r);
   drawCanvas();
 }
 
@@ -886,6 +888,169 @@ function renderJumperResult(res, box) {
     <h4>各管段状态（含新增跨接管段）</h4>
     <table><thead><tr><th>管段</th><th>端点</th><th>来源</th><th>绑定阀门</th><th>状态</th></tr></thead>
     <tbody>${segRows}</tbody></table>`;
+}
+
+// ---------- 失效监测点布设预览 ----------
+// 入口: 可行方案详情(历史方案"查看"或刚求解出的方案)下方的预览卡片。
+// 只读计算, 不修改管网与历史方案。
+function appendMonitorPanel(r) {
+  if (r.id == null) return; // 未入库结果不提供预览入口
+  const body = $("#result-body");
+  const card = document.createElement("div");
+  card.className = "card";
+  card.id = "monitor-card";
+  card.innerHTML = `
+    <h3>失效监测点布设预览 <span class="role-name">(只读计算, 不修改管网与历史方案)</span></h3>
+    <p class="role-name">
+      从方案快照的<b>非进水节点</b>中录入至多 12 个候选监测点(编号不重复),
+      每个候选点填<b>正整数布设费</b>。系统分别模拟方案<b>正常执行</b>与
+      <b>每枚计划关闭阀门单独关不上</b>(其绑定管段保持通水)时的供水连通状态,
+      选择布设费总和最低、同费按节点编号升序列表字典序最小的点集, 使任意两种
+      情形在所选点的<b>有水/无水读数</b>都不同; 候选点无法区分某些情形时,
+      列出这些情形对。
+    </p>
+    <table id="table-monitors"><thead><tr>
+      <th>监测点(非进水节点)</th><th>角色</th><th>布设费</th><th></th>
+    </tr></thead><tbody></tbody></table>
+    <button id="btn-add-monitor" class="add-row" type="button">＋ 添加候选监测点</button>
+    <p>
+      <button id="btn-monitors" type="button" class="primary">监测点布设预览求解</button>
+      <span class="role-name" id="monitor-hint"></span>
+    </p>
+    <div id="monitor-errors" class="errors hidden"></div>
+    <div id="monitor-result"></div>`;
+  body.appendChild(card);
+
+  const points = []; // 本地候选: {node_id, fee}
+  const tbody = card.querySelector("#table-monitors tbody");
+  const nonInlet = state.nodes.filter((n) => n.role !== "inlet" && n.id.trim());
+  const nodeOpts = (sel) => nonInlet.map((n) =>
+    `<option value="${esc(n.id)}"${n.id === sel ? " selected" : ""}>${
+      esc(n.id)}（${ROLE_TEXT[n.role]}）</option>`).join("");
+
+  function renderRows() {
+    tbody.innerHTML = points.map((c, i) => `
+      <tr data-i="${i}">
+        <td><select data-f="node_id"><option value=""></option>${nodeOpts(c.node_id)}</select></td>
+        <td>${esc(ROLE_TEXT[(nonInlet.find((n) => n.id === c.node_id) || {}).role] || "—")}</td>
+        <td><input data-f="fee" type="number" min="1" step="1" value="${esc(c.fee)}"></td>
+        <td class="act"><button data-del="${i}" title="删除">✕</button></td>
+      </tr>`).join("");
+    card.querySelector("#monitor-hint").textContent =
+      `候选监测点 ${points.length} 个（至多 12 个, 只能选非进水节点）；预览只读`;
+  }
+
+  card.querySelector("#btn-add-monitor").addEventListener("click", () => {
+    if (points.length >= 12) {
+      const errBox = card.querySelector("#monitor-errors");
+      errBox.innerHTML = "<b>候选监测点最多 12 个</b>";
+      errBox.classList.remove("hidden");
+      return;
+    }
+    points.push({ node_id: "", fee: 1 });
+    renderRows();
+  });
+  tbody.addEventListener("input", (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr) return;
+    const i = Number(tr.dataset.i);
+    const f = e.target.dataset.f;
+    if (f === undefined) return;
+    points[i][f] = (f === "fee") ? Number(e.target.value) : e.target.value;
+    if (f === "node_id") renderRows();
+  });
+  tbody.addEventListener("change", renderRows);
+  tbody.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-del]");
+    if (!btn) return;
+    points.splice(Number(btn.dataset.del), 1);
+    renderRows();
+  });
+  card.querySelector("#btn-monitors").addEventListener("click", async () => {
+    const errBox = card.querySelector("#monitor-errors");
+    const resBox = card.querySelector("#monitor-result");
+    errBox.classList.add("hidden");
+    resBox.innerHTML = "";
+    const candidates = points
+      .filter((c) => c.node_id)
+      .map((c) => ({ node_id: c.node_id, fee: c.fee }));
+    try {
+      const res = await api("POST", `/api/plans/${r.id}/monitors`, { candidates });
+      renderMonitorResult(res, resBox);
+    } catch (err) {
+      errBox.innerHTML = `<b>无法求解监测点布设预览:</b><ul>${
+        String(err.message).split("\n").map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`;
+      errBox.classList.remove("hidden");
+    }
+  });
+  renderRows();
+}
+
+function renderMonitorResult(res, box) {
+  const bannerCls = res.distinguishable ? "ok" : "bad";
+  const head = res.distinguishable
+    ? (res.selected_ids.length ? "✓ 监测点布设方案" : "✓ 无需布设监测点")
+    : "✗ 候选点无法区分全部情形";
+
+  const selTable = res.selected_points.length ? `
+    <table><thead><tr><th>顺序</th><th>节点编号</th><th>角色</th><th>名称</th><th>布设费</th></tr></thead>
+    <tbody>${res.selected_points.map((p, k) => `
+      <tr><td>${k + 1}</td><td><b>${esc(p.node_id)}</b></td>
+      <td>${ROLE_TEXT[p.role] || "—"}</td>
+      <td>${p.label && p.label !== p.node_id ? esc(p.label) : "—"}</td>
+      <td>${esc(p.fee)}</td></tr>`).join("")}
+    </tbody></table>` : "<p>不布设任何监测点。</p>";
+
+  // 读数矩阵: 可区分时只展示选中点; 不可区分时展示全部候选点
+  const shownIds = res.distinguishable
+    ? res.selected_ids
+    : (res.candidates || []).map((c) => c.node_id);
+  const readingOf = (sc, nid) => sc.readings.find((x) => x.node_id === nid);
+  const readingRows = res.scenarios.map((sc) => `
+    <tr>
+      <td>${esc(sc.label)}</td>
+      <td>${sc.failed_valve ? esc(sc.failed_valve) : "—"}</td>
+      <td>${sc.segment_id ? esc(sc.segment_id) : "—"}</td>
+      ${shownIds.map((nid) => {
+        const rd = readingOf(sc, nid);
+        return rd
+          ? `<td>${rd.wet
+              ? '<span class="tag supplied">有水</span>'
+              : '<span class="tag disconnected">无水</span>'}</td>`
+          : "<td>—</td>";
+      }).join("")}
+    </tr>`).join("");
+  const readingTable = shownIds.length ? `
+    <table class="monitor-matrix"><thead><tr>
+      <th>情形</th><th>关不上的阀门</th><th>保持通水的管段</th>
+      ${shownIds.map((nid) => `<th>${esc(nid)}</th>`).join("")}
+    </tr></thead><tbody>${readingRows}</tbody></table>` : "";
+
+  const pairBlock = res.distinguishable ? "" : `
+    <h4>无法区分的情形对（${res.indistinguishable_pairs.length} 对）</h4>
+    <table><thead><tr><th>#</th><th>情形 A</th><th>情形 B</th></tr></thead>
+    <tbody>${res.indistinguishable_pairs.map((p, i) => `
+      <tr><td>${i + 1}</td>
+      <td>${esc(p.scenarios[0].label)}</td>
+      <td>${esc(p.scenarios[1].label)}</td></tr>`).join("")}
+    </tbody></table>
+    <p class="role-name">下表给出全部候选点在各情形下的读数: 上述情形对在每个候选点上
+    的有水/无水读数都相同, 增加或更换这些候选点无法区分; 需要在相应管段下游增设
+    可达性不同的监测点。</p>`;
+
+  box.innerHTML = `
+    <div class="banner ${bannerCls}">
+      <span class="big">${head}</span>${esc(res.message)}
+      <br><small>共 ${res.scenario_count} 种情形(正常执行 + ${
+        res.closed_valves.length} 种单阀关不上), 枚举 ${res.subset_count} 个候选点
+      组合。本结果为只读预览, 未修改管网与历史方案。</small>
+    </div>
+    <h4>选中监测点（${res.selected_points.length} 个, 布设费合计 ${res.place_cost_total}）</h4>
+    ${selTable}
+    <p class="role-name">优化次序: 先最小化布设费总和; 同费时按节点编号升序列表的字典序最小者。
+    任意两种情形在选中点上的有水/无水读数向量必须互不相同。</p>
+    ${readingTable ? `<h4>${res.distinguishable ? "各情形在选中点的有水/无水读数" : "各情形在全部候选点的有水/无水读数"}</h4>${readingTable}` : ""}
+    ${pairBlock}`;
 }
 
 // ---------- 历史 ----------

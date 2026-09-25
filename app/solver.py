@@ -37,6 +37,14 @@
 点有水; 先最大化由断水转为有水的普通节点数, 再最小化铺设费合计, 并列时
 按跨接编号升序列表字典序选取; 无法恢复普通节点时返回空方案。
 
+以及 plan_monitors(snapshot, closed_valves, raw_candidates): 已保存可行
+方案的失效监测点布设预览(只读计算)。从方案快照的非进水节点中录入至多
+12 个候选监测点(编号不重复 + 正整数布设费), 分别模拟方案正常执行与每枚
+计划关闭阀门单独关不上(其绑定管段保持通水)时的供水连通状态; 枚举候选
+点子集, 选择使任意两种情形在所选点上的有水/无水读数都不同(读数向量两两
+可区分)的点集, 最小化布设费合计, 同费按节点编号升序列表字典序决胜。
+若候选点无法区分某些情形, 列出这些情形对。
+
 以及 solve_tradeoff(payload, raw_weights): 关阀成本与断水影响权衡预览
 (只读计算, 针对当前编辑管网)。为每个普通节点录入正整数用水权重, 枚举
 全部关阀子集, 仅保留全部漏点与进水点断开且全部必保点仍有水的方案, 以
@@ -55,6 +63,7 @@ from typing import Any
 
 MAX_VALVES = 14
 MAX_CANDIDATES = 6
+MAX_MONITOR_CANDIDATES = 12
 
 
 class NetworkValidationError(ValueError):
@@ -1257,6 +1266,232 @@ def plan_jumpers(snapshot: dict[str, Any],
         "still_disconnected_normal": still_disconnected,
         "node_status": statuses["node_status"],
         "segment_status": statuses["segment_status"],
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 失效监测点布设预览(只读计算, 针对已保存的可行方案)
+# ---------------------------------------------------------------------------
+
+def plan_monitors(snapshot: dict[str, Any],
+                  closed_valves: list[str],
+                  raw_candidates: Any) -> dict[str, Any]:
+    """已保存可行方案的失效监测点布设预览(只读, 不改方案与管网)。
+
+    从方案快照的非进水节点中给出至多 MAX_MONITOR_CANDIDATES 个候选监测点,
+    每个候选含节点编号(不重复、必须是快照中存在的非进水节点)与正整数布设
+    费。模拟方案的 k+1 种执行情形: 正常执行(全部计划阀门关闭)以及每一枚
+    计划阀门单独关不上(其绑定管段保持通水, 其余阀门照常关闭)。每个监测
+    点在每种情形下读取该节点是否有水(是否与至少一个进水点连通)。
+
+    枚举全部候选点子集(<=2^12=4096), 保留使任意两种情形的有水/无水读数
+    向量互不相同的点集, 依次最小化:
+      1) 布设费合计;
+      2) 节点编号升序列表的字典序。
+    若不存在这样的点集(候选点无法区分某些情形), 列出无法区分的情形对。
+    """
+    try:
+        nodes, segments, valves = validate_network(snapshot)
+    except NetworkValidationError as exc:
+        raise NetworkValidationError(
+            ["方案快照数据不合法: " + e for e in exc.errors]) from exc
+
+    errors: list[str] = []
+
+    # ---- 计划阀门必须存在于快照中 ----
+    valve_by_id = {vl["id"]: vl for vl in valves}
+    closed = sorted(dict.fromkeys(_norm_id(v) for v in (closed_valves or [])))
+    for vid in closed:
+        if vid not in valve_by_id:
+            errors.append(f"方案关闭的阀门 {vid} 不存在于方案快照的管网中")
+
+    # ---- 候选监测点录入校验: 数量 / 编号 / 非进水节点 / 正整数布设费 ----
+    if raw_candidates is None:
+        raw_candidates = []
+    if not isinstance(raw_candidates, list):
+        raise NetworkValidationError(["candidates 必须是数组"])
+    if len(raw_candidates) > MAX_MONITOR_CANDIDATES:
+        errors.append(f"候选监测点数量为 {len(raw_candidates)}, "
+                      f"超过上限 {MAX_MONITOR_CANDIDATES} 个")
+    node_by_id = {nd["id"]: nd for nd in nodes}
+    cands: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for i, cd in enumerate(raw_candidates):
+        if not isinstance(cd, dict):
+            errors.append(f"候选监测点 #{i + 1}: 必须是对象")
+            continue
+        nid = _norm_id(cd.get("node_id"))
+        if not nid:
+            errors.append(f"候选监测点 #{i + 1}: 缺少节点编号")
+        elif nid in seen:
+            errors.append(f"候选监测点编号重复: {nid}")
+        seen.add(nid)
+        label = nid or f"#{i + 1}"
+        nd = node_by_id.get(nid) if nid else None
+        if nid and nd is None:
+            errors.append(f"候选监测点 {label}: 节点 {nid} 不存在于方案快照的节点中")
+        elif nd is not None and nd["role"] == "inlet":
+            errors.append(f"候选监测点 {label}: 节点 {nid} 是进水点, "
+                          f"监测点只能布设在非进水节点上")
+        fee = _positive_int(cd.get("fee"))
+        if fee is None:
+            errors.append(f"候选监测点 {label}: 布设费必须是正整数, "
+                          f"收到: {cd.get('fee')!r}")
+        cands.append({"node_id": nid, "fee": fee,
+                      "role": nd["role"] if nd else None,
+                      "label": nd["label"] if nd else (nid or "")})
+    if errors:
+        raise NetworkValidationError(errors)
+
+    g = _Graph(nodes, segments, valves)
+    v_idx = {vl["id"]: b for b, vl in enumerate(g.valves_sorted)}
+    base_mask = 0
+    for vid in closed:
+        base_mask |= 1 << v_idx[vid]
+
+    # ---- 情形: 正常执行 + 每枚计划阀门单独关不上 ----
+    scenarios: list[dict[str, Any]] = [
+        {"key": "normal", "label": "正常执行(全部按计划关闭)",
+         "failed_valve": None, "segment_id": None, "mask": base_mask},
+    ]
+    for vid in closed:
+        b = v_idx[vid]
+        scenarios.append({
+            "key": f"valve:{vid}",
+            "label": f"阀门 {vid} 关不上"
+                     f"(管段 {valve_by_id[vid]['segment_id']} 保持通水)",
+            "failed_valve": vid,
+            "segment_id": valve_by_id[vid]["segment_id"],
+            "mask": base_mask ^ (1 << b),
+        })
+
+    # ---- 每种情形下各节点是否有水(多进水点 BFS) ----
+    fed = [g.reachable(sc["mask"], g.inlet_set) for sc in scenarios]
+    wet = [[bool((fm >> g.idx[c["node_id"]]) & 1) for fm in fed]
+           for c in cands]
+
+    t = len(scenarios)
+    # ---- 候选点本身无法区分的情形对(所有候选读数都相同) ----
+    unseparable: list[tuple[int, int]] = []
+    for a in range(t):
+        for b in range(a + 1, t):
+            if all(wet[j][a] == wet[j][b] for j in range(len(cands))):
+                unseparable.append((a, b))
+
+    def scenario_pair(a: int, b: int) -> dict[str, Any]:
+        return [
+            {"key": scenarios[a]["key"], "label": scenarios[a]["label"],
+             "failed_valve": scenarios[a]["failed_valve"],
+             "segment_id": scenarios[a]["segment_id"]},
+            {"key": scenarios[b]["key"], "label": scenarios[b]["label"],
+             "failed_valve": scenarios[b]["failed_valve"],
+             "segment_id": scenarios[b]["segment_id"]},
+        ]
+
+    def scenario_block(a: int) -> dict[str, Any]:
+        sc = scenarios[a]
+        return {"key": sc["key"], "label": sc["label"],
+                "failed_valve": sc["failed_valve"],
+                "segment_id": sc["segment_id"],
+                "readings": [
+                    {"node_id": cands[j]["node_id"], "wet": wet[j][a]}
+                    for j in range(len(cands))
+                ]}
+
+    if unseparable:
+        return {
+            "ok": True,
+            "distinguishable": False,
+            "closed_valves": closed,
+            "scenario_count": t,
+            "candidate_count": len(cands),
+            "candidates": cands,
+            "subset_count": 1 << len(cands),
+            "selected_points": [],
+            "selected_ids": [],
+            "place_cost_total": 0,
+            "indistinguishable_pairs": [
+                {"scenarios": scenario_pair(a, b)} for a, b in unseparable
+            ],
+            "scenarios": [scenario_block(a) for a in range(t)],
+            "message": (
+                f"失效监测点布设预览(只读, 不修改管网与历史方案): 共 "
+                f"{t} 种情形(正常执行 + {len(closed)} 种单阀关不上), "
+                f"候选监测点无法区分 {len(unseparable)} 对情形, 无论选择哪些"
+                f"候选点都无法在所选点的有水/无水读数上加以区分; 请在相应"
+                f"管段下游增设可达性不同的监测点。"),
+        }
+
+    # ---- 枚举候选子集: 每个候选点一个"情形可分性签名", 按位或后全可分 ----
+    m = len(cands)
+    pair_index = {(a, b): p for p, (a, b) in
+                  enumerate((a, b) for a in range(t) for b in range(a + 1, t))}
+    signatures = [0] * m
+    for j in range(m):
+        sig = 0
+        for (a, b), p in pair_index.items():
+            if wet[j][a] != wet[j][b]:
+                sig |= 1 << p
+        signatures[j] = sig
+    full_sig = (1 << len(pair_index)) - 1
+
+    fees = [c["fee"] for c in cands]
+    subset_fee = [0] * (1 << m)
+    for s in range(1, 1 << m):
+        low = s & -s
+        subset_fee[s] = subset_fee[s ^ low] + fees[low.bit_length() - 1]
+
+    best_mask = 0
+    best_fee: int | None = None
+    best_list: tuple[str, ...] | None = None
+    for s in range(1 << m):
+        sig = 0
+        bits = s
+        while bits:
+            low = bits & -bits
+            sig |= signatures[low.bit_length() - 1]
+            if sig == full_sig:
+                break
+            bits ^= low
+        if sig != full_sig:
+            continue
+        ids = tuple(sorted(cands[j]["node_id"] for j in range(m)
+                           if (s >> j) & 1))
+        fee = subset_fee[s]
+        if (best_fee is None or fee < best_fee
+                or (fee == best_fee and ids < best_list)):
+            best_fee, best_mask, best_list = fee, s, ids
+
+    selected = [dict(cands[j]) for j in range(m) if (best_mask >> j) & 1]
+    selected.sort(key=lambda c: c["node_id"])
+    selected_ids = [c["node_id"] for c in selected]
+
+    if closed:
+        message = (
+            f"失效监测点布设预览(只读, 不修改管网与历史方案): 共 {t} 种情形"
+            f"(正常执行 + {len(closed)} 种单阀关不上), 布设 "
+            f"{len(selected_ids)} 个监测点({', '.join(selected_ids)}), "
+            f"布设费合计 {best_fee}; 任意两种情形在所选点的有水/无水读数均"
+            f"不相同。")
+    else:
+        message = (
+            "失效监测点布设预览(只读, 不修改管网与历史方案): 该方案不关闭"
+            "任何阀门, 只有正常执行一种情形, 无需布设监测点(布设费 0)。")
+
+    return {
+        "ok": True,
+        "distinguishable": True,
+        "closed_valves": closed,
+        "scenario_count": t,
+        "candidate_count": len(cands),
+        "candidates": cands,
+        "subset_count": 1 << m,
+        "selected_points": selected,
+        "selected_ids": selected_ids,
+        "place_cost_total": best_fee,
+        "indistinguishable_pairs": [],
+        "scenarios": [scenario_block(a) for a in range(t)],
         "message": message,
     }
 
